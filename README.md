@@ -445,7 +445,3 @@ O projeto integra conceitos de Internet das Coisas, comunicação entre disposit
 A integração entre o ESP32, o MQTT, o backend, o banco de dados e a interface gráfica permite acompanhar as medições e visualizar os resultados das classificações realizadas pelo sistema.
 
 O protótipo representa uma aplicação prática de tecnologias computacionais no monitoramento ambiental, com possibilidades de expansão e aprimoramento em trabalhos futuros.
-
----
-
-**Projeto desenvolvido como Trabalho de Conclusão de Curso.**
