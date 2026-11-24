@@ -5,13 +5,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 
-# 1. Definir o caminho da base de dados oficial da CETESB
 caminho_excel = "BASE_DADOS_TURBIDEZ_PH_TDS.xlsx"
 
 if not os.path.exists(caminho_excel):
-    print(
-        f"ERRO: Ficheiro '{caminho_excel}' não encontrado na pasta backend!"
-    )
+    print(f"ERRO: Ficheiro '{caminho_excel}' não encontrado na pasta backend!")
     print("Por favor, coloque o ficheiro .xlsx dentro do diretório 'backend'.")
     exit()
 
@@ -27,7 +24,6 @@ for sheet in xls.sheet_names:
 df_bruto = pd.concat(dfs, ignore_index=True)
 print(f"   Total de registos brutos encontrados: {len(df_bruto):,}")
 
-# 2. Tratamento e Limpeza dos Dados
 print("\n2. A processar e a organizar os parâmetros (pH, Turbidez, TDS)...")
 df_bruto["valor_num"] = pd.to_numeric(
     df_bruto["Resultado_Texto"], errors="coerce"
@@ -39,7 +35,6 @@ if "Resultado_numerico" in df_bruto.columns:
 
 df_clean = df_bruto.dropna(subset=["valor_num"]).copy()
 
-# Mapeamento dos parâmetros da CETESB
 param_map = {
     "pH": "ph",
     "Turbidez": "turbidez",
@@ -47,7 +42,6 @@ param_map = {
 }
 df_clean["param"] = df_clean["Parametro"].map(param_map)
 
-# Pivotar para juntar pH, Turbidez e TDS da mesma coleta na mesma linha
 pivoted = df_clean.pivot_table(
     index=["CodPonto", "Coleta_Data", "Coleta_Hora"],
     columns="param",
@@ -55,37 +49,34 @@ pivoted = df_clean.pivot_table(
     aggfunc="mean",
 ).reset_index()
 
-# Filtrar apenas amostras que possuem a tríade completa (pH, Turbidez e TDS)
 amostras = pivoted.dropna(subset=["ph", "turbidez", "tds"]).copy()
-print(
-    f"   Amostras completas e válidas para treino: {len(amostras):,} linhas"
-)
+print(f"   Amostras completas e válidas para treino: {len(amostras):,} linhas")
 
 
-# 3. Regra de Rotulagem Baseada nas Normas Oficiais (CONAMA / Portaria Min. Saúde)
+# 3. Regra de Rotulagem alinhada à Faixa de Referência do sistema (água doce)
 def classificar_qualidade(row):
     ph = row["ph"]
     turb = row["turbidez"]
     tds = row["tds"]
 
-    # 2 = Crítica (Fora dos limites legais severos)
-    if ph < 5.0 or ph > 9.5 or turb > 15.0 or tds > 1000.0:
+    # 2 = Fora da faixa de referência
+    if ph < 6.0 or ph > 9.0 or turb > 100.0 or tds > 500.0:
         return 2
-    # 1 = Atenção (Pequenos desvios da qualidade ideal)
-    elif (ph < 6.5 or ph > 8.5) or (turb > 5.0) or (tds > 500.0):
+    # 1 = No limite da faixa de referência (próximo às bordas)
+    elif ph < 6.3 or ph > 8.7 or turb > 80.0 or tds > 400.0:
         return 1
-    # 0 = Excelente / Potável (Dentro do padrão de potabilidade)
+    # 0 = Dentro da faixa de referência
     else:
         return 0
 
 
 amostras["classe"] = amostras.apply(classificar_qualidade, axis=1)
+print("   Distribuição das classes na base:")
+print(amostras["classe"].value_counts().sort_index().to_dict())
 
-# Separar atributos (X) e rótulos (y)
 X = amostras[["ph", "turbidez", "tds"]]
 y = amostras["classe"]
 
-# 4. Treino e Validação da Inteligência Artificial
 print("\n3. A treinar o algoritmo Random Forest Classifier...")
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, random_state=42
@@ -94,12 +85,10 @@ X_train, X_test, y_train, y_test = train_test_split(
 model = RandomForestClassifier(n_estimators=100, random_state=42)
 model.fit(X_train, y_train)
 
-# Avaliação da acurácia
 y_pred = model.predict(X_test)
 acuracia = accuracy_score(y_test, y_pred)
 print(f"   Acurácia do modelo treinado: {acuracia * 100:.2f}%")
 
-# 5. Guardar o novo cérebro da IA
 joblib.dump(model, "water_model.pkl")
 print(
     "\n✅ Modelo de IA treinado com DADOS REAIS de SP e salvo com sucesso em"

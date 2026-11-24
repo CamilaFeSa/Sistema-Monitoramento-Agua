@@ -1,7 +1,9 @@
-import json
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
+import json
+import os
+import threading
+
 from fastapi import Depends, FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
@@ -9,13 +11,14 @@ import joblib
 import numpy as np
 import paho.mqtt.client as mqtt
 import pandas as pd
-
-# --- CONFIGURAÇÃO DO BANCO DE DADOS (POSTGRESQL - NEON CLOUD) ---
 from sqlalchemy import JSON, Column, Float, Integer, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
-# URL de conexão segura com o Neon (já inserida corretamente)
-SQLALCHEMY_DATABASE_URL =  "postgresql://neondb_owner:npg_QtzM4iy2IKLm@ep-twilight-brook-b4om86n4-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+# --- CONFIGURAÇÃO DO BANCO DE DADOS (POSTGRESQL - NEON CLOUD) ---
+SQLALCHEMY_DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://neondb_owner:npg_QtzM4iy2IKLm@ep-twilight-brook-b4om86n4-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+)
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -30,7 +33,7 @@ class LeituraDB(Base):
     ph = Column(Float)
     turbidez_ntu = Column(Float)
     tds_ppm = Column(Float)
-    classificacao_regras = Column(String)
+    classificacao_regras = Column(String, nullable=True, default=None)
     classificacao_ia = Column(String)
     confianca_ia = Column(String)
     status = Column(String)
@@ -48,31 +51,75 @@ def get_db():
         db.close()
 
 
-# --- CONFIGURAÇÃO MQTT (CONECTADO AO MOSQUITTO LOCAL) ---
-MQTT_BROKER = "localhost"
+# --- CONFIGURAÇÃO MQTT ---
+MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
-MQTT_TOPIC = "tcc/sensores/agua"
 
-# --- CARREGAMENTO DO MODELO DE IA ---
+MQTT_TOPICS = [
+    "camila/tcc/agua/leituras",
+]
+
+# --- MODELO DE INTELIGÊNCIA ARTIFICIAL (RANDOM FOREST) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "water_model.pkl")
+
 try:
-    ml_model = joblib.load("water_model.pkl")
-    print("Modelo de IA (water_model.pkl) carregado com sucesso!")
+    ml_model = joblib.load(MODEL_PATH)
+    print(f"Modelo de IA carregado com sucesso de: {MODEL_PATH}")
 except Exception as e:
     ml_model = None
-    print(f"Aviso: Não foi possível carregar o modelo de IA: {e}")
+    print(f"Aviso: Não foi possível carregar o modelo de IA ({MODEL_PATH}): {e}")
 
 CLASSES_ML = {
-    0: "Excelente / Potável",
-    1: "Atenção (Parâmetros limítrofes)",
-    2: "Crítica (Fora dos padrões)",
+    0: "Dentro da faixa de referência",
+    1: "No limite da faixa de referência",
+    2: "Fora da faixa de referência",
 }
+
+STATUS_POR_CLASSE_IA = {
+    "Dentro da faixa de referência": "Dentro da faixa de referência",
+    "No limite da faixa de referência": "Dentro da faixa de referência",
+    "Fora da faixa de referência": "Fora da faixa de referência",
+}
+
+
+def normalizar_rotulo_faixa(texto: str | None) -> str | None:
+    if texto is None:
+        return None
+    resultado = texto.replace(
+        "Limítrofe à faixa de referência", "No limite da faixa de referência"
+    ).replace(
+        "Limitrofe à faixa de referência", "No limite da faixa de referência"
+    )
+    resultado = resultado.replace("Limítrofe", "No limite").replace(
+        "Limitrofe", "No limite"
+    )
+    return resultado
+
+
+def serializar_leitura(leitura: LeituraDB) -> dict:
+    return {
+        "id": leitura.id,
+        "horario": leitura.horario,
+        "ph": leitura.ph,
+        "turbidez_ntu": leitura.turbidez_ntu,
+        "tds_ppm": leitura.tds_ppm,
+        "classificacao_regras": normalizar_rotulo_faixa(
+            leitura.classificacao_regras
+        ),
+        "classificacao_ia": normalizar_rotulo_faixa(leitura.classificacao_ia),
+        "confianca_ia": leitura.confianca_ia,
+        "status": normalizar_rotulo_faixa(leitura.status),
+        "detalhes": leitura.detalhes,
+    }
+
 
 ultimo_estado_sensor = {
     "horario": None,
     "ph": 7.0,
     "turbidez_ntu": 0.0,
     "tds_ppm": 0,
-    "classificacao_regras": "Aguardando dados...",
+    "classificacao_regras": None,
     "classificacao_ia": "Aguardando dados...",
     "confianca_ia": "0%",
     "status": "Inativo",
@@ -80,81 +127,86 @@ ultimo_estado_sensor = {
 }
 
 
-def analisar_qualidade_regras(ph: float, turbidez: float, tds: float):
-    detalhes = {}
+def gerar_detalhes_sensores(ph: float, turbidez: float, tds: float) -> dict:
+    """Apenas resume os valores medidos por sensor sem aplicar regras de decisão."""
+    return {
+        "ph": f"pH medido: {ph}",
+        "turbidez": f"Turbidez medida: {turbidez} NTU",
+        "tds": f"TDS medido: {tds} ppm",
+    }
 
-    if ph < 6.0:
-        detalhes["ph"] = "Água muito ácida"
-    elif ph > 8.5:
-        detalhes["ph"] = "Água muito alcalina/básica"
-    else:
-        detalhes["ph"] = "pH dentro do ideal"
 
-    if turbidez > 15.0:
-        detalhes["turbidez"] = "Turbidez muito alta (água turva/barrenta)"
-    elif turbidez > 5.0:
-        detalhes["turbidez"] = "Turbidez em estado de alerta"
-    else:
-        detalhes["turbidez"] = "Turbidez dentro do ideal"
+def comparar_referencia_normativa(ph: float, turbidez: float, tds: float) -> str:
+    """Comparativo de referência para água doce (pH 6.0-9.0, Turbidez <= 100 NTU, TDS <= 500 ppm)."""
+    fora = []
+    if not (6.0 <= ph <= 9.0):
+        fora.append("pH")
+    if turbidez > 100.0:
+        fora.append("Turbidez")
+    if tds > 500.0:
+        fora.append("TDS")
 
-    if tds > 1000.0:
-        detalhes["tds"] = "Sólidos dissolvidos muito elevados"
-    elif tds > 500.0:
-        detalhes["tds"] = "Sólidos dissolvidos em alerta"
-    else:
-        detalhes["tds"] = "TDS dentro do ideal"
-
-    if (6.5 <= ph <= 8.0) and (turbidez <= 5.0) and (tds < 500):
-        classificacao = "Excelente / Potável"
-        status_sistema = "Normal"
-    elif (6.0 <= ph <= 8.5) and (turbidez <= 15.0) and (tds < 800):
-        classificacao = "Atenção (Parâmetros limítrofes)"
-        status_sistema = "Alerta"
-    else:
-        classificacao = "Crítica (Fora dos padrões)"
-        status_sistema = "Crítico"
-
-    return classificacao, status_sistema, detalhes
+    if not fora:
+        return "Dentro da faixa de referência"
+    return f"Fora da faixa de referência ({', '.join(fora)})"
 
 
 def predizer_qualidade_ml(ph: float, turbidez: float, tds: float):
+    """Avalia a leitura exclusivamente pelo modelo Random Forest treinado."""
     if ml_model is None:
-        return "Modelo Indisponível", "0%"
+        return "Modelo Indisponível", "Inativo", "0%"
 
     entrada = pd.DataFrame(
-        [[ph, turbidez, tds]], columns=["ph", "turbidez", "tds"]
+        [[ph, turbidez, tds]],
+        columns=["ph", "turbidez", "tds"],
     )
     predicao_classe = ml_model.predict(entrada)[0]
     probabilidades = ml_model.predict_proba(entrada)[0]
-    confianca = max(probabilidades) * 100
-    rotulo = CLASSES_ML.get(predicao_classe, "Desconhecido")
-    return rotulo, f"{confianca:.1f}%"
+    confianca_pct = float(np.max(probabilidades)) * 100.0
+
+    rotulo_bruto = CLASSES_ML.get(predicao_classe, str(predicao_classe))
+    rotulo = normalizar_rotulo_faixa(rotulo_bruto) or str(rotulo_bruto)
+    status_sistema = STATUS_POR_CLASSE_IA.get(
+        rotulo, "Fora da faixa de referência"
+    )
+    return rotulo, status_sistema, f"{confianca_pct:.1f}%"
 
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
-        print("Conectado com sucesso ao Broker MQTT (Mosquitto)!")
-        client.subscribe(MQTT_TOPIC)
+def on_connect(client, userdata, flags, reason_code, properties=None):
+    if reason_code == 0:
+        print("Conectado com sucesso ao HiveMQ!")
+        for topic in MQTT_TOPICS:
+            client.subscribe(topic)
+            print(f"Inscrito no tópico: {topic}")
     else:
-        print(f"Falha na conexão ao MQTT. Código de retorno: {rc}")
+        print(f"Falha na conexão MQTT. Código: {reason_code}")
 
 
 def on_message(client, userdata, msg):
     global ultimo_estado_sensor
+
     try:
         payload = msg.payload.decode("utf-8")
-        print(f"\n[MQTT] Nova mensagem recebida no tópico '{msg.topic}': {payload}")
         dados = json.loads(payload)
 
-        ph = float(dados.get("ph", 7.0))
-        turbidez = float(dados.get("turbidez", dados.get("turbidez_ntu", 0.0)))
-        tds = float(dados.get("tds", dados.get("tds_ppm", 0)))
+        ph = float(dados["ph"])
+        tds = float(dados["tds"])
+        turbidez = float(dados["turbidez"])
 
-        class_regras, status_sistema, detalhes = analisar_qualidade_regras(
+        if not all(np.isfinite(v) for v in (ph, tds, turbidez)):
+            print("[MQTT] Leitura inválida: valor não numérico ou infinito.")
+            return
+
+        print(
+            f"\n[MQTT] Leitura completa recebida: "
+            f"pH={ph}, TDS={tds}, Turbidez={turbidez}"
+        )
+
+        class_ia, status_sistema, confianca_ia = predizer_qualidade_ml(
             ph, turbidez, tds
         )
-        class_ia, confianca_ia = predizer_qualidade_ml(ph, turbidez, tds)
-
+        class_regras = comparar_referencia_normativa(ph, turbidez, tds)
+        detalhes = gerar_detalhes_sensores(ph, turbidez, tds)
         horario_atual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         leitura_dict = {
@@ -177,13 +229,17 @@ def on_message(client, userdata, msg):
             db.add(nova_leitura)
             db.commit()
             print(
-                f"[Banco de Dados Neon] Leitura salva: {horario_atual} | IA: {class_ia}"
+                f"[Banco de Dados Neon] Leitura salva: "
+                f"{horario_atual} | Ref: {class_regras} | IA: {class_ia} ({confianca_ia})"
             )
         except Exception as db_error:
-            print(f"[Erro DB] Falha ao salvar no banco: {db_error}")
+            db.rollback()
+            print(f"[Erro DB] Falha ao salvar: {db_error}")
         finally:
             db.close()
 
+    except (ValueError, KeyError, json.JSONDecodeError) as e:
+        print(f"[MQTT] Mensagem inválida: {e}")
     except Exception as e:
         print(f"Erro ao processar mensagem MQTT: {e}")
 
@@ -287,23 +343,26 @@ def read_root():
 )
 def get_sensor_status(db: Session = Depends(get_db)):
     if ultimo_estado_sensor["horario"] is not None:
-        return ultimo_estado_sensor
+        return {
+            **ultimo_estado_sensor,
+            "classificacao_regras": normalizar_rotulo_faixa(
+                ultimo_estado_sensor.get("classificacao_regras")
+            ),
+            "classificacao_ia": normalizar_rotulo_faixa(
+                ultimo_estado_sensor.get("classificacao_ia")
+            ),
+            "status": normalizar_rotulo_faixa(
+                ultimo_estado_sensor.get("status")
+            ),
+        }
 
     ultima_leitura = (
         db.query(LeituraDB).order_by(LeituraDB.id.desc()).first()
     )
     if ultima_leitura:
-        return {
-            "horario": ultima_leitura.horario,
-            "ph": ultima_leitura.ph,
-            "turbidez_ntu": ultima_leitura.turbidez_ntu,
-            "tds_ppm": ultima_leitura.tds_ppm,
-            "classificacao_regras": ultima_leitura.classificacao_regras,
-            "classificacao_ia": ultima_leitura.classificacao_ia,
-            "confianca_ia": ultima_leitura.confianca_ia,
-            "status": ultima_leitura.status,
-            "detalhes": ultima_leitura.detalhes,
-        }
+        dado = serializar_leitura(ultima_leitura)
+        dado.pop("id", None)
+        return dado
 
     return ultimo_estado_sensor
 
@@ -316,6 +375,10 @@ def get_sensor_status(db: Session = Depends(get_db)):
 )
 def get_sensor_historico(db: Session = Depends(get_db)):
     leituras_db = (
-        db.query(LeituraDB).order_by(LeituraDB.id.desc()).limit(20).all()
+        db.query(LeituraDB).order_by(LeituraDB.id.desc()).limit(100).all()
     )
-    return {"total_leituras": len(leituras_db), "historico": leituras_db}
+    historico_normalizado = [serializar_leitura(item) for item in leituras_db]
+    return {
+        "total_leituras": len(historico_normalizado),
+        "historico": historico_normalizado,
+    }
